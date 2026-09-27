@@ -44,7 +44,11 @@ def read_ods(path, max_cols=200, with_formulas=False):
             row_repeat = int(row.get(qn('table', 'number-rows-repeated'), '1'))
             row_cells = []
             row_formulas = []
-            for cell in row.findall(qn('table', 'table-cell')) + row.findall(qn('table', 'covered-table-cell')):
+            cell_tag = qn('table', 'table-cell')
+            covered_tag = qn('table', 'covered-table-cell')
+            for cell in row:
+                if cell.tag not in (cell_tag, covered_tag):
+                    continue
                 col_repeat = int(cell.get(qn('table', 'number-columns-repeated'), '1'))
                 val = cell_value(cell)
                 formula = cell.get(qn('table', 'formula'))

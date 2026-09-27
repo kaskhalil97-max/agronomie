@@ -33,6 +33,7 @@ from collections import Counter
 
 import openpyxl
 
+import recalc
 from ods_reader import read_ods
 from ods_writer import OdsDocument
 
@@ -203,6 +204,11 @@ def fill_month(avant_path, nord_path, sud_path, out_path, year, month):
     }
 
     report = []
+    written = {}  # commune -> {(row, col): value} of every raw cell we touched
+
+    def record_write(commune, row, col, value):
+        doc.set_cell_value(commune, row, col, value)
+        written.setdefault(commune, {})[(row, col)] = value
 
     def write_field(commune, offset, source_cols, workbook_key, data_sheet):
         rows = sheets[commune]
@@ -226,7 +232,7 @@ def fill_month(avant_path, nord_path, sud_path, out_path, year, month):
 
         if len(targets) == 1:
             wr, wc = targets[0]
-            doc.set_cell_value(commune, wr, wc, sum(values))
+            record_write(commune, wr, wc, sum(values))
             tag = "direct" if (wr, wc) == (row_idx, col_idx) else f"redirected->R{wr}C{wc}"
             report.append(f"  [OK] {commune} offset{offset} ({tag}) = {sum(values)}")
         else:
@@ -240,7 +246,7 @@ def fill_month(avant_path, nord_path, sud_path, out_path, year, month):
             else:
                 distributed = values
             for (wr, wc), v in zip(targets, distributed):
-                doc.set_cell_value(commune, wr, wc, v)
+                record_write(commune, wr, wc, v)
             report.append(
                 f"  [OK] {commune} offset{offset} (redirected->{len(targets)} cells) = {distributed} (total {sum(values)})"
             )
@@ -251,6 +257,22 @@ def fill_month(avant_path, nord_path, sud_path, out_path, year, month):
 
     for offset, source_cols in BEZIERS_OFFSETS.items():
         write_field('BEZIERS', offset, source_cols, BEZIERS_WORKBOOK, BEZIERS_DATA_SHEET)
+
+    # Bake correct cached results into every formula cell that depends
+    # (directly or transitively) on something we just wrote, so the
+    # file already displays right even if the spreadsheet app opening
+    # it never recalculates on its own.
+    for commune, overlay in written.items():
+        values = [list(row) for row in sheets[commune]]
+        for (r, c), v in overlay.items():
+            while len(values[r]) <= c:
+                values[r].append(None)
+            values[r][c] = v
+        updates = recalc.recalculate(values, formulas[commune])
+        for (r, c), v in updates.items():
+            doc.set_formula_cache(commune, r, c, v)
+        if updates:
+            report.append(f"  [recalc] {commune}: {len(updates)} formule(s) mise(s) a jour")
 
     doc.save(out_path)
     return report

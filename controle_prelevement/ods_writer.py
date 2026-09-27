@@ -200,6 +200,28 @@ class OdsDocument:
         )
         return patched.encode('utf-8') if n else None
 
+    def set_formula_cache(self, sheet_name, row_idx, col_idx, value):
+        """Update the cached result of a formula cell (leaving the
+        formula itself untouched). Used to bake in correct values for
+        cells that depend on ones we just edited, so the file already
+        displays right even before any spreadsheet app recalculates."""
+        table = self._get_table(sheet_name)
+        row = self._isolate_row(table, row_idx)
+        cell = self._isolate_cell(row, col_idx)
+
+        if not cell.get(qn('table', 'formula')):
+            raise ValueError(
+                f"set_formula_cache called on a non-formula cell at {sheet_name}!R{row_idx}C{col_idx}"
+            )
+
+        for p in cell.findall(qn('text', 'p')):
+            cell.remove(p)
+
+        cell.set(qn('office', 'value-type'), 'float')
+        cell.set(qn('office', 'value'), repr(float(value)))
+        p = ET.SubElement(cell, qn('text', 'p'))
+        p.text = str(int(value)) if float(value).is_integer() else str(value)
+
     def save(self, out_path):
         new_content = ET.tostring(self.root, encoding='UTF-8', xml_declaration=True)
 
