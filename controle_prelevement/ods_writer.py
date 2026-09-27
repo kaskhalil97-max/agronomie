@@ -6,6 +6,7 @@ groups as needed so a single target cell can be isolated and modified,
 while leaving every other cell (including all formulas) untouched.
 """
 import copy
+import re
 import shutil
 import zipfile
 
@@ -18,6 +19,8 @@ NS = {
 }
 for prefix, uri in NS.items():
     ET.register_namespace(prefix, uri)
+
+XMLNS_ATTR_RE = re.compile(r'xmlns:([A-Za-z0-9_.-]+)="([^"]*)"')
 
 
 def qn(prefix, tag):
@@ -36,6 +39,33 @@ class OdsDocument:
         self.path = path
         self.zip_in = zipfile.ZipFile(path, 'r')
         self.content_bytes = self.zip_in.read('content.xml')
+
+        # ElementTree only re-emits xmlns declarations for namespaces it
+        # sees used on an actual element/attribute *name*. ODF formulas
+        # store their dialect prefix (e.g. "of:=SUM(...)") inside the
+        # *text value* of table:formula, which ElementTree has no idea
+        # needs "xmlns:of" declared on the root -- so a naive
+        # parse-then-reserialize silently drops it, and LibreOffice can
+        # no longer tell which grammar to parse formulas with (every
+        # formula in the file then shows as literal text / Err:510).
+        #
+        # Fix, in two parts:
+        #  1. Pre-register every namespace prefix the source file itself
+        #     uses, so ElementTree's serializer reuses the same short
+        #     names instead of inventing ns0/ns1/... (cosmetic, but also
+        #     removes any chance of prefix collisions).
+        #  2. At save time, re-add any xmlns declaration from the
+        #     original root tag that ElementTree still dropped (because
+        #     it is genuinely never used as a real element/attribute
+        #     name) -- "of" is the one that matters.
+        text = self.content_bytes.decode('utf-8')
+        m = re.match(r'\s*(<\?xml[^>]*\?>)?\s*(<office:document-content\b[^>]*)>', text)
+        if not m:
+            raise ValueError("Could not locate <office:document-content> root tag")
+        self._orig_root_namespaces = dict(XMLNS_ATTR_RE.findall(m.group(2)))
+        for prefix, uri in self._orig_root_namespaces.items():
+            ET.register_namespace(prefix, uri)
+
         self.root = ET.fromstring(self.content_bytes)
         body = self.root.find(qn('office', 'body'))
         self.spreadsheet = body.find(qn('office', 'spreadsheet'))
@@ -145,6 +175,23 @@ class OdsDocument:
 
     def save(self, out_path):
         new_content = ET.tostring(self.root, encoding='UTF-8', xml_declaration=True)
+
+        # Re-add any xmlns declaration ElementTree dropped because it
+        # never saw the prefix used as a real element/attribute name
+        # (see __init__) -- most importantly "of", which ODF formulas
+        # reference only inside an attribute *value* string.
+        generated_text = new_content.decode('utf-8')
+        m = re.match(r'<\?xml[^>]*\?>\s*<office:document-content\b([^>]*)>', generated_text)
+        if not m:
+            raise ValueError("Unexpected: could not find generated root tag")
+        declared = dict(XMLNS_ATTR_RE.findall(m.group(1)))
+        missing = {p: u for p, u in self._orig_root_namespaces.items() if p not in declared}
+        if missing:
+            extra = ''.join(f' xmlns:{p}="{u}"' for p, u in missing.items())
+            insert_at = m.start(1)
+            generated_text = generated_text[:insert_at] + extra + generated_text[insert_at:]
+        new_content = generated_text.encode('utf-8')
+
         shutil.copyfile(self.path, out_path)
         # Rewrite the zip, replacing only content.xml
         self.zip_in.close()
