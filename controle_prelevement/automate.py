@@ -191,9 +191,71 @@ def get_data_row_values(wb, sheet_name, target_date, col_letters_list):
     return values
 
 
-def fill_month(avant_path, nord_path, sud_path, out_path, year, month):
-    target_date = datetime.date(year, month, 1)
+def _fill_one_month(target_date, sheets, formulas, workbooks, record_write, report):
+    """Write every commune's raw readings for target_date, taking the
+    Nord/Sud workbooks as the sole source of truth: whatever value is
+    already sitting in the control file for that month is overwritten
+    if the source workbooks disagree (e.g. a meter reading that came in
+    late and only appears in an updated Nord/Sud export after the
+    month was first filled)."""
     target_date_str = target_date.isoformat()
+
+    def write_field(commune, offset, source_cols, workbook_key, data_sheet):
+        rows = sheets[commune]
+        frows = formulas[commune]
+        header_row_idx = find_header_row(rows)
+        date_col = find_date_col(rows, header_row_idx)
+        try:
+            row_idx = find_target_row(rows, date_col, target_date_str)
+        except ValueError as e:
+            report.append(f"  [!] {commune} {target_date_str} offset{offset}: {e}")
+            return
+        col_idx = date_col + offset
+
+        raw_values = get_data_row_values(workbooks[workbook_key], data_sheet, target_date, source_cols)
+        if all(v is None for v in raw_values):
+            report.append(f"  [-] {commune} {target_date_str} offset{offset}: no source data, skipped")
+            return
+        values = [v if v is not None else 0.0 for v in raw_values]
+
+        try:
+            targets = resolve_write_cells(row_idx, col_idx, frows)
+        except ValueError as e:
+            report.append(f"  [!] {commune} {target_date_str} offset{offset}: {e}")
+            return
+
+        if len(targets) == 1:
+            wr, wc = targets[0]
+            record_write(commune, wr, wc, sum(values))
+            tag = "direct" if (wr, wc) == (row_idx, col_idx) else f"redirected->R{wr}C{wc}"
+            report.append(f"  [OK] {commune} {target_date_str} offset{offset} ({tag}) = {sum(values)}")
+        else:
+            # Destination is a sum of several manual cells. Distribute
+            # source values 1:1 when counts match; otherwise dump the
+            # whole total into the first term and zero the rest, since
+            # addition is commutative and the *displayed total* is what
+            # matters (only the term-by-term split would be ambiguous).
+            if len(values) != len(targets):
+                distributed = [sum(values)] + [0.0] * (len(targets) - 1)
+            else:
+                distributed = values
+            for (wr, wc), v in zip(targets, distributed):
+                record_write(commune, wr, wc, v)
+            report.append(
+                f"  [OK] {commune} {target_date_str} offset{offset} (redirected->{len(targets)} cells)"
+                f" = {distributed} (total {sum(values)})"
+            )
+
+    for commune, cfg in CONFIG.items():
+        for offset, source_cols in cfg['offsets']:
+            write_field(commune, offset, source_cols, cfg['workbook'], cfg['data_sheet'])
+
+    for offset, source_cols in BEZIERS_OFFSETS.items():
+        write_field('BEZIERS', offset, source_cols, BEZIERS_WORKBOOK, BEZIERS_DATA_SHEET)
+
+
+def fill_month(avant_path, nord_path, sud_path, out_path, year, month, resync_previous=True):
+    target_date = datetime.date(year, month, 1)
 
     sheets, formulas = read_ods(avant_path, with_formulas=True)
     doc = OdsDocument(avant_path)
@@ -210,53 +272,14 @@ def fill_month(avant_path, nord_path, sud_path, out_path, year, month):
         doc.set_cell_value(commune, row, col, value)
         written.setdefault(commune, {})[(row, col)] = value
 
-    def write_field(commune, offset, source_cols, workbook_key, data_sheet):
-        rows = sheets[commune]
-        frows = formulas[commune]
-        header_row_idx = find_header_row(rows)
-        date_col = find_date_col(rows, header_row_idx)
-        row_idx = find_target_row(rows, date_col, target_date_str)
-        col_idx = date_col + offset
+    if resync_previous:
+        prev_year, prev_month = (year, month - 1) if month > 1 else (year - 1, 12)
+        prev_date = datetime.date(prev_year, prev_month, 1)
+        report.append(f"-- Resynchronisation de {prev_date.isoformat()} avec les fichiers Nord/Sud a jour --")
+        _fill_one_month(prev_date, sheets, formulas, workbooks, record_write, report)
 
-        raw_values = get_data_row_values(workbooks[workbook_key], data_sheet, target_date, source_cols)
-        if all(v is None for v in raw_values):
-            report.append(f"  [-] {commune} offset{offset}: no source data for {target_date_str}, skipped")
-            return
-        values = [v if v is not None else 0.0 for v in raw_values]
-
-        try:
-            targets = resolve_write_cells(row_idx, col_idx, frows)
-        except ValueError as e:
-            report.append(f"  [!] {commune} offset{offset}: {e}")
-            return
-
-        if len(targets) == 1:
-            wr, wc = targets[0]
-            record_write(commune, wr, wc, sum(values))
-            tag = "direct" if (wr, wc) == (row_idx, col_idx) else f"redirected->R{wr}C{wc}"
-            report.append(f"  [OK] {commune} offset{offset} ({tag}) = {sum(values)}")
-        else:
-            # Destination is a sum of several manual cells. Distribute
-            # source values 1:1 when counts match; otherwise dump the
-            # whole total into the first term and zero the rest, since
-            # addition is commutative and the *displayed total* is what
-            # matters (only the term-by-term split would be ambiguous).
-            if len(values) != len(targets):
-                distributed = [sum(values)] + [0.0] * (len(targets) - 1)
-            else:
-                distributed = values
-            for (wr, wc), v in zip(targets, distributed):
-                record_write(commune, wr, wc, v)
-            report.append(
-                f"  [OK] {commune} offset{offset} (redirected->{len(targets)} cells) = {distributed} (total {sum(values)})"
-            )
-
-    for commune, cfg in CONFIG.items():
-        for offset, source_cols in cfg['offsets']:
-            write_field(commune, offset, source_cols, cfg['workbook'], cfg['data_sheet'])
-
-    for offset, source_cols in BEZIERS_OFFSETS.items():
-        write_field('BEZIERS', offset, source_cols, BEZIERS_WORKBOOK, BEZIERS_DATA_SHEET)
+    report.append(f"-- Remplissage de {target_date.isoformat()} --")
+    _fill_one_month(target_date, sheets, formulas, workbooks, record_write, report)
 
     # Bake correct cached results into every formula cell that depends
     # (directly or transitively) on something we just wrote, so the
@@ -325,6 +348,9 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--sortie', help="Fichier de sortie (par defaut: <controle>_rempli.ods)")
     parser.add_argument('--annee', type=int, help="Annee du mois a remplir (par defaut: detection automatique)")
     parser.add_argument('--mois', type=int, help="Mois a remplir, 1-12 (par defaut: detection automatique)")
+    parser.add_argument('--no-resync-precedent', action='store_true',
+                         help="Ne pas re-verifier le mois precedent contre les fichiers Nord/Sud a jour "
+                              "(par defaut, il est resynchronise si une valeur y a change)")
     args = parser.parse_args()
 
     if args.annee and args.mois:
@@ -340,7 +366,8 @@ if __name__ == '__main__':
 
     print(f"Remplissage du mois {month:02d}/{year}...")
     try:
-        report = fill_month(args.controle_ods, args.nord_xlsx, args.sud_xlsx, out_path, year, month)
+        report = fill_month(args.controle_ods, args.nord_xlsx, args.sud_xlsx, out_path, year, month,
+                             resync_previous=not args.no_resync_precedent)
     except Exception as e:
         print(f"ERREUR: {e}", file=sys.stderr)
         sys.exit(1)
