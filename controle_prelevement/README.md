@@ -1,5 +1,16 @@
 # Automatisation CONTROLE_CONSIGNE_PRELEVEMENT
 
+## Prérequis (une seule fois)
+Le script utilise Python 3 et la librairie `openpyxl` pour lire les fichiers Excel. Si vous avez ce message au lancement :
+```
+ModuleNotFoundError: No module named 'openpyxl'
+```
+installez-la avec :
+```
+pip install openpyxl
+```
+(sous Windows, si `pip` seul ne fonctionne pas : `py -m pip install openpyxl` ou `python -m pip install openpyxl`)
+
 ## Fichiers
 - `ods_reader.py` : lit un .ods (valeurs + formules) sans dépendance externe (odfpy indisponible dans cet environnement).
 - `ods_writer.py` : modifie des cellules précises d'un .ods en place (gère l'éclatement des `number-rows/columns-repeated`), refuse d'écraser une formule.
